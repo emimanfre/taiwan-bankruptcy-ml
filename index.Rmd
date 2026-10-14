@@ -1,0 +1,659 @@
+---
+title: "Taiwanese Corporate Bankruptcy Prediction"
+subtitle: "Rare Event Handling, Boruta Feature Selection, and Bayesian Prior Recalibration"
+author: "Emilio Manfredi"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@700;800&family=Literata:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  body { font-family: 'Literata', Georgia, serif; color: #16213A; background-color: #EDF1F6; line-height: 1.65; }
+  .main-container { background-color: #F8FAFC; padding: 2rem 2.5rem; border: 1px solid #BFCADB; box-shadow: 8px 8px 0 #BFCADB; margin-top: 2rem; margin-bottom: 2rem; }
+  h1, h2, h3, h4, .tocify { font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800; color: #16213A; }
+  h2::after { content: ""; display: block; width: 3rem; height: 4px; background: #E8A317; margin-top: 0.4rem; margin-bottom: 1rem; }
+  a { color: #1F4FD8; }
+  .list-group-item.active, .list-group-item.active:focus, .list-group-item.active:hover {
+    background-color: #16213A; border-color: #16213A; color: #EDF1F6;
+  }
+  .btn-default { font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700; border: 2px solid #16213A; color: #16213A; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE,
+  fig.width = 9,
+  fig.height = 6
+)
+options(scipen = 999)
+
+library(caret)
+library(Boruta)
+library(funModeling)
+library(pROC)
+library(reshape2)
+library(gbm)
+library(ROCR)
+library(ROSE)
+library(dplyr)
+
+# Safety function to clean any NA/NaN/Inf values in transformed Validation Sets
+clean_newdata <- function(df) {
+  data.frame(lapply(df, function(x) {
+    if (is.numeric(x)) {
+      x[!is.finite(x)] <- 0
+    }
+    return(x)
+  }))
+}
+```
+
+## Data Preparation, Oversampling, and Feature Selection (Boruta)
+
+```{r data-and-boruta}
+data <- read.csv("data.csv")
+prop.table(table(data$Bankrupt.)) # Imbalanced dataset: Bankrupt == 1 is a rare event (~3.2%)
+data$Bankrupt. <- as.factor(data$Bankrupt.)
+
+set.seed(123)
+indices <- createDataPartition(data$Bankrupt., p = 0.7, list = FALSE)
+train_data <- data[indices, ]
+val_data   <- data[-indices, ]
+
+table(train_data$Bankrupt.)
+
+set.seed(123)
+n <- nrow(train_data)
+
+oversampled <- train_data %>%
+  filter(Bankrupt. == 1) %>%
+  sample_n(round(0.3 * n), replace = TRUE) %>%
+  bind_rows(filter(train_data, Bankrupt. == 0))
+
+oversampled$Bankrupt <- as.numeric(oversampled$Bankrupt.)
+oversampled$Bankrupt. <- NULL
+
+# Target encoding for caret ("c1" = Non-Bankrupt, "c2" = Bankrupt)
+y_caret <- as.character(oversampled$Bankrupt)
+y_caret <- recode(y_caret, "2" = "c2", "1" = "c1")
+oversampled$Bankrupt <- as.factor(y_caret)
+
+table(oversampled$Bankrupt)
+
+# Disk cache check for Boruta
+if (file.exists("boruta_model.rds")) {
+  boruta_model <- readRDS("boruta_model.rds")
+} else {
+  set.seed(123)
+  train_data$Bankrupt. <- as.factor(train_data$Bankrupt.)
+  boruta_model <- Boruta(Bankrupt. ~ ., data = train_data, doTrace = 0)
+  saveRDS(boruta_model, "boruta_model.rds")
+}
+
+plot(boruta_model, cex.axis = 0.6, las = 2, main = "Boruta Feature Importance")
+
+final_boruta <- TentativeRoughFix(boruta_model)
+selected_vars <- getSelectedAttributes(final_boruta, withTentative = FALSE)
+cat("Number of variables selected by Boruta:", length(selected_vars), "\n")
+
+ds.boruta <- oversampled[, selected_vars]
+
+# Using YeoJohnson instead of BoxCox to safely handle values <= 0 in the validation set
+all_together <- preProcess(ds.boruta, method = c("corr", "nzv", "YeoJohnson", "center", "scale"))
+global_Xprocessed.total <- clean_newdata(data.frame(predict(all_together, newdata = ds.boruta)))
+global_Xprocessed.total$Bankrupt <- oversampled[["Bankrupt"]]
+
+optsol <- 0.5
+
+# Numeric target vectors (0/1) for ASE calculation
+y_ASE <- as.numeric(recode(as.character(oversampled$Bankrupt), "c2" = "1", "c1" = "0"))
+y_ASE.test <- as.numeric(as.character(val_data$Bankrupt.))
+
+# Sample proportion parameters (rho) and true population priors (true)
+rho1 <- 0.70; rho2 <- 0.30
+true1 <- 0.97; true2 <- 0.03
+```
+
+---
+
+## STEP 1: Model Training, Prior Recalibration, and Overfitting
+
+In this section, we train and compare 7 different Machine Learning architectures using **5-Fold Cross-Validation**, optimizing the Area Under the ROC Curve (`metric = "ROC"`) or specific classification metrics[cite: 1]. 
+
+Since the models are trained on the artificially balanced dataset ($\rho_1 = 0.70, \rho_2 = 0.30$), the predicted probabilities are biased relative to the actual incidence of bankruptcies in the market ($\pi_1 = 0.97, \pi_2 = 0.03$)[cite: 1]. Therefore, for each model we apply **Bayes' correction for true priors**[cite: 1]:
+
+$$\hat{P}(Y = c_2 \mid X) = \frac{\hat{P}_{over}(Y = c_2 \mid X) \cdot \frac{\pi_2}{\rho_2}}{\hat{P}_{over}(Y = c_2 \mid X) \cdot \frac{\pi_2}{\rho_2} + \hat{P}_{over}(Y = c_1 \mid X) \cdot \frac{\pi_1}{\rho_1}}$$
+
+Finally, we evaluate generalization capability by comparing the **Average Squared Error (ASE)** between the Training Set and the Validation Set[cite: 1].
+
+---
+
+### Model 1: Penalized Logistic Regression (Lasso)
+
+**Lasso** regression (*Least Absolute Shrinkage and Selection Operator*) introduces an $L_1$-norm penalty into the binomial log-likelihood function ($\alpha = 1$)[cite: 1]:
+
+$$\min_{\beta} \left\{ -\ell(\beta) + \lambda \sum_{j=1}^{p} \vert{}\beta_j\vert{} \right\}$$
+
+**Behavior in the case study:** In corporate financial statement datasets, many ratios exhibit strong multicollinearity (e.g., multiple correlated profit margins or liquidity ratios)[cite: 1]. The $L_1$ penalty forces the coefficients of redundant variables to exactly zero as the hyperparameter $\lambda$ increases, performing intrinsic *feature selection* that reduces model variance and prevents overfitting[cite: 1].
+
+```{r model-lasso}
+set.seed(1234)
+metric <- "ROC"
+
+# Specific preprocessing: near-zero variance removal and standardization (essential for L1 penalty)
+lasso.preProcVal <- preProcess(oversampled, method = c("nzv", "center", "scale")) 
+lasso.preproc    <- clean_newdata(data.frame(predict(lasso.preProcVal, newdata = oversampled)))
+lasso.preproc$Bankrupt <- oversampled$Bankrupt
+val_lasso        <- clean_newdata(data.frame(predict(lasso.preProcVal, newdata = val_data)))
+
+grid <- expand.grid(.alpha = 1, .lambda = seq(0, 1, by = 0.01))
+Control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+if (file.exists("lasso_model.rds")) {
+  lasso_PP <- readRDS("lasso_model.rds")
+} else {
+  set.seed(1234)
+  lasso_PP <- train(Bankrupt ~ ., data = lasso.preproc, method = "glmnet", family = "binomial",
+                    trControl = Control, tuneLength = 5, tuneGrid = grid, 
+                    na.action = na.exclude, metric = metric)
+  saveRDS(lasso_PP, "lasso_model.rds")
+}
+
+best_lambda <- lasso_PP$bestTune$lambda
+cat("Best selected Lambda:", best_lambda, "\n")
+plot(lasso_PP$finalModel, xvar = "lambda", label = TRUE)
+
+# Recalibration with True Priors
+predProb.lasso  <- predict(lasso_PP, lasso.preproc, type = "prob") 
+predProb2.lasso <- predProb.lasso$c2
+predProb1.lasso <- 1 - predProb2.lasso
+
+den.lasso        <- predProb2.lasso * (true2 / rho2) + predProb1.lasso * (true1 / rho1)
+pred2_true.lasso <- predProb2.lasso * (true2 / rho2) / den.lasso
+
+par(mfrow = c(1, 2))
+hist(pred2_true.lasso, main = "Recalibrated Probabilities (Lasso)", xlab = "True Prob.", col = "#1F4FD8", border = "white")
+plot(predProb2.lasso, pred2_true.lasso, main = "Shrinkage toward True Priors", xlab = "Oversampled Prob.", ylab = "True Prob.", col = "#16213A", pch = 16)
+par(mfrow = c(1, 1))
+
+lasso_prediction_true <- ifelse(pred2_true.lasso > optsol, 2, 1)
+table(Actual_Target = y_caret, Lasso_Prediction = lasso_prediction_true)
+
+# Overfitting Check (ASE)
+train_prob.lasso <- predict(lasso_PP, lasso.preproc, type = "prob")
+test_prob.lasso  <- predict(lasso_PP, val_lasso, type = "prob")
+
+train_pred.lasso <- ifelse(train_prob.lasso[, "c2"] > 0.5, 1, 0)
+test_pred.lasso  <- ifelse(test_prob.lasso[, "c2"] > 0.5, 1, 0)
+
+train_ASE.lasso  <- mean((y_ASE - train_pred.lasso)^2)
+test_ASE.lasso   <- mean((y_ASE.test - test_pred.lasso)^2)
+over.lasso       <- ((train_ASE.lasso - test_ASE.lasso) / train_ASE.lasso) * 100
+
+cat("ASE (Training):", round(train_ASE.lasso, 4), 
+    "| ASE (Test):", round(test_ASE.lasso, 4), 
+    "| % Change:", round(over.lasso, 2), "%\n")
+```
+
+---
+
+### Model 2: Naive Bayes
+
+The **Naive Bayes** classifier is a probabilistic generative model based on Bayes' theorem, which assumes **conditional independence** among features given the class label[cite: 1]:
+
+$$P(Y = c_k \mid X_1, \dots, X_p) \propto P(Y = c_k) \prod_{j=1}^{p} P(X_j \mid Y = c_k)$$
+
+**Behavior in the case study:** Despite removing the most correlated variables during preprocessing (`method = "corr"`), financial statement data structurally violate the global independence assumption[cite: 1]. Consequently, Naive Bayes tends to produce extreme probability estimates (pushed toward 0 or 1) and exhibits lower discriminative power compared to discriminative or tree-based models[cite: 1].
+
+```{r model-naivebayes}
+set.seed(1234)
+
+preProcVal        <- preProcess(oversampled, method = c("corr", "nzv"))
+global_Xprocessed <- clean_newdata(data.frame(predict(preProcVal, newdata = oversampled)))
+global_Xprocessed$Bankrupt <- oversampled$Bankrupt
+val_nb            <- clean_newdata(data.frame(predict(preProcVal, newdata = val_data)))
+
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+if (file.exists("nb_model.rds")) {
+  naivebayes <- readRDS("nb_model.rds")
+} else {
+  set.seed(1234)
+  naivebayes <- train(Bankrupt ~ ., data = global_Xprocessed, method = "naive_bayes",
+                      trControl = ctrl, tuneLength = 5, na.action = na.pass, metric = metric)
+  saveRDS(naivebayes, "nb_model.rds")
+}
+
+naivebayes
+confusionMatrix(naivebayes)
+
+# Recalibration with True Priors
+predProb.bayes  <- predict(naivebayes, global_Xprocessed, type = "prob") 
+predProb2.bayes <- predProb.bayes$c2
+predProb1.bayes <- 1 - predProb2.bayes
+
+den.bayes        <- predProb2.bayes * (true2 / rho2) + predProb1.bayes * (true1 / rho1)
+pred2_true.bayes <- predProb2.bayes * (true2 / rho2) / den.bayes
+
+par(mfrow = c(1, 2))
+hist(pred2_true.bayes, main = "Recalibrated Probabilities (Naive Bayes)", xlab = "True Prob.", col = "#E8A317", border = "white")
+plot(predProb2.bayes, pred2_true.bayes, main = "Shrinkage toward True Priors", xlab = "Oversampled Prob.", ylab = "True Prob.", col = "#16213A", pch = 16)
+par(mfrow = c(1, 1))
+
+bayes_prediction_true <- ifelse(pred2_true.bayes > optsol, 2, 1)
+table(Actual_Target = y_caret, NB_Prediction = bayes_prediction_true)
+
+# Overfitting Check (ASE)
+train_prob.bayes <- predict(naivebayes, global_Xprocessed, type = "prob")
+test_prob.bayes  <- predict(naivebayes, val_nb, type = "prob")
+
+train_pred.bayes <- ifelse(train_prob.bayes[, "c2"] > 0.5, 1, 0)
+test_pred.bayes  <- ifelse(test_prob.bayes[, "c2"] > 0.5, 1, 0)
+
+train_ASE.bayes <- mean((y_ASE - train_pred.bayes)^2)
+test_ASE.bayes  <- mean((y_ASE.test - test_pred.bayes)^2)
+over.bayes      <- ((train_ASE.bayes - test_ASE.bayes) / train_ASE.bayes) * 100
+
+cat("ASE (Training):", round(train_ASE.bayes, 4), 
+    "| ASE (Test):", round(test_ASE.bayes, 4), 
+    "| % Change:", round(over.bayes, 2), "%\n")
+```
+
+---
+
+### Model 3: Logistic Regression (GLM)
+
+The **Generalized Linear Model (GLM)** with a *logit* link function estimates the probability of default as a linear combination of the predictors selected by Boruta and transformed via Yeo-Johnson[cite: 1]:
+
+$$\log\left(\frac{p}{1-p}\right) = \beta_0 + \beta_1 X_1 + \dots + \beta_k X_k$$
+
+**Behavior in the case study:** It represents the quintessential parametric benchmark in banking *credit scoring*[cite: 1]. The preliminary application of **Boruta** and the correlation filter allows the GLM to converge smoothly without suffering from numerical instability, yielding well-calibrated probability estimates albeit constrained by the assumption of a linear decision boundary[cite: 1].
+
+```{r model-glm}
+set.seed(1234)
+
+val_glm <- clean_newdata(data.frame(predict(all_together, newdata = val_data[, selected_vars])))
+
+if (file.exists("glm_model.rds")) {
+  glm <- readRDS("glm_model.rds")
+} else {
+  set.seed(1234)
+  glm <- train(Bankrupt ~ ., data = global_Xprocessed.total, method = "glm", 
+               trControl = ctrl, tuneLength = 5, trace = FALSE, na.action = na.pass, metric = metric)
+  saveRDS(glm, "glm_model.rds")
+}
+
+confusionMatrix(glm)
+
+# Recalibration with True Priors
+predProb.log  <- predict(glm, global_Xprocessed.total, type = "prob") 
+predProb2.log <- predProb.log$c2
+predProb1.log <- 1 - predProb2.log
+
+den.log        <- predProb2.log * (true2 / rho2) + predProb1.log * (true1 / rho1)
+pred2_true.log <- predProb2.log * (true2 / rho2) / den.log
+
+par(mfrow = c(1, 2))
+hist(pred2_true.log, main = "Recalibrated Probabilities (GLM)", xlab = "True Prob.", col = "#1F4FD8", border = "white")
+plot(predProb2.log, pred2_true.log, main = "Shrinkage toward True Priors", xlab = "Oversampled Prob.", ylab = "True Prob.", col = "#16213A", pch = 16)
+par(mfrow = c(1, 1))
+
+logit_prediction_true <- ifelse(pred2_true.log > optsol, 2, 1)
+table(Actual_Target = y_caret, GLM_Prediction = logit_prediction_true)
+
+# Overfitting Check (ASE)
+train_prob.glm <- predict(glm, global_Xprocessed.total, type = "prob")
+test_prob.glm  <- predict(glm, val_glm, type = "prob")
+
+train_pred.glm <- ifelse(train_prob.glm[, "c2"] > 0.5, 1, 0)
+test_pred.glm  <- ifelse(test_prob.glm[, "c2"] > 0.5, 1, 0)
+
+train_ASE.glm <- mean((y_ASE - train_pred.glm)^2, na.rm = TRUE)
+test_ASE.glm  <- mean((y_ASE.test - test_pred.glm)^2, na.rm = TRUE)
+over.glm      <- ((train_ASE.glm - test_ASE.glm) / train_ASE.glm) * 100
+
+cat("ASE (Training):", round(train_ASE.glm, 4), 
+    "| ASE (Test):", round(test_ASE.glm, 4), 
+    "| % Change:", round(over.glm, 2), "%\n")
+```
+
+---
+
+### Model 4: K-Nearest Neighbors (K-NN)
+
+**K-NN** is a non-parametric, *instance-based* algorithm that classifies an observation based on the majority class among its $k$ nearest neighbors in the Euclidean feature space[cite: 1].
+
+**Behavior in the case study:** Because it relies on geometric distance calculations, K-NN strictly requires standardization (`center` and `scale`) and dimensionality reduction via Boruta to mitigate the *curse of dimensionality*[cite: 1]. With oversampling (which duplicates minority class observations), small values of $k$ tend to capture local clusters of insolvent firms very well, but expose the model to a higher risk of overfitting to local noise[cite: 1].
+
+```{r model-knn}
+set.seed(1234)
+
+preProcVal.knn  <- preProcess(ds.boruta, method = c("scale", "corr", "center", "nzv"))
+df.knn          <- clean_newdata(data.frame(predict(preProcVal.knn, newdata = ds.boruta)))
+df.knn$Bankrupt <- oversampled$Bankrupt
+val_knn         <- clean_newdata(data.frame(predict(preProcVal.knn, newdata = val_data[, selected_vars])))
+
+grid_knn <- expand.grid(k = seq(5, 20, 3))
+
+if (file.exists("knn_model.rds")) {
+  knn <- readRDS("knn_model.rds")
+} else {
+  set.seed(1234)
+  knn <- train(Bankrupt ~ ., data = df.knn, method = "knn",
+               trControl = ctrl, tuneLength = 5, na.action = na.pass,
+               tuneGrid = grid_knn, metric = metric)
+  saveRDS(knn, "knn_model.rds")
+}
+
+plot(knn, main = "K-NN Tuning (ROC vs Number of Neighbors k)")
+confusionMatrix(knn)
+
+# Recalibration with True Priors
+predProb.knn  <- predict(knn, df.knn, type = "prob") 
+predProb2.knn <- predProb.knn$c2
+predProb1.knn <- 1 - predProb2.knn
+
+den.knn        <- predProb2.knn * (true2 / rho2) + predProb1.knn * (true1 / rho1)
+pred2_true.knn <- predProb2.knn * (true2 / rho2) / den.knn
+
+knn_prediction_true <- ifelse(pred2_true.knn > optsol, 2, 1)
+table(Actual_Target = y_caret, KNN_Prediction = knn_prediction_true)
+
+# Overfitting Check (ASE)
+train_prob.knn <- predict(knn, df.knn, type = "prob")
+test_prob.knn  <- predict(knn, val_knn, type = "prob")
+
+train_pred.knn <- ifelse(train_prob.knn[, "c2"] > 0.5, 1, 0)
+test_pred.knn  <- ifelse(test_prob.knn[, "c2"] > 0.5, 1, 0)
+
+train_ASE.knn <- mean((y_ASE - train_pred.knn)^2)
+test_ASE.knn  <- mean((y_ASE.test - test_pred.knn)^2)
+over.knn      <- ((train_ASE.knn - test_ASE.knn) / train_ASE.knn) * 100
+
+cat("ASE (Training):", round(train_ASE.knn, 4), 
+    "| ASE (Test):", round(test_ASE.knn, 4), 
+    "| % Change:", round(over.knn, 2), "%\n")
+```
+
+---
+
+### Model 5: Random Forest
+
+**Random Forest** is an *ensemble* method based on **Bagging** (*Bootstrap Aggregating*) of unpruned decision trees, combined with random sampling of a subset of features (`mtry`) at each split[cite: 1].
+
+**Behavior in the case study:** Decision trees natively capture complex non-linear interactions and critical thresholds in financial statements (e.g., a company that goes bankrupt only when simultaneously experiencing high leverage *and* low liquidity)[cite: 1]. Furthermore, they are invariant to monotonic transformations of variables (requiring no scaling)[cite: 1]. Tree decorrelation ensures outstanding predictive performance (among the highest AUCs overall), although training error physiologically approaches zero[cite: 1].
+
+```{r model-rf}
+set.seed(1234)
+cvCtrl <- trainControl(method = "cv", number = 5, search = "grid", classProbs = TRUE, summaryFunction = twoClassSummary)
+
+if (file.exists("rf_model.rds")) {
+  rf <- readRDS("rf_model.rds")
+} else {
+  set.seed(1234)
+  rf <- train(Bankrupt ~ ., data = oversampled, method = "rf", trControl = cvCtrl, metric = metric)
+  saveRDS(rf, "rf_model.rds")
+}
+
+rf
+getTrainPerf(rf)
+confusionMatrix(rf)
+
+# Recalibration with True Priors directly on the Validation Set (for subsequent Steps)
+predProb.rf  <- predict(rf, val_data, type = "prob") 
+predProb2.rf <- predProb.rf$c2
+predProb1.rf <- 1 - predProb2.rf
+
+den.rf        <- predProb2.rf * (true2 / rho2) + predProb1.rf * (true1 / rho1)
+pred2_true.rf <- predProb2.rf * (true2 / rho2) / den.rf
+pred1_true.rf <- predProb1.rf * (true1 / rho1) / den.rf
+
+par(mfrow = c(1, 2))
+hist(pred2_true.rf, main = "Recalibrated Probs on Validation (RF)", xlab = "True Prob.", col = "#E4572E", border = "white")
+plot(predProb2.rf, pred2_true.rf, main = "Bayesian Prior Recalibration Effect (RF)", xlab = "Raw RF Prob.", ylab = "True Prior Prob.", col = "#16213A", pch = 16)
+par(mfrow = c(1, 1))
+
+# Overfitting Check (ASE)
+train_prob.rf <- predict(rf, oversampled, type = "prob")
+test_prob.rf  <- predict(rf, val_data, type = "prob")
+
+train_pred.rf <- ifelse(train_prob.rf[, "c2"] > 0.5, 1, 0)
+test_pred.rf  <- ifelse(test_prob.rf[, "c2"] > 0.5, 1, 0)
+
+train_ASE.rf <- mean((y_ASE - train_pred.rf)^2)
+test_ASE.rf  <- mean((y_ASE.test - test_pred.rf)^2)
+over.rf      <- ((train_ASE.rf - test_ASE.rf) / train_ASE.rf) * 100
+
+cat("ASE (Training):", round(train_ASE.rf, 4), 
+    "| ASE (Test):", round(test_ASE.rf, 4), "\n")
+```
+
+---
+
+### Model 6: Artificial Neural Networks (MLP - Grid & Random Search)
+
+We train a *Multi-Layer Perceptron* neural network (`nnet` package) with a single hidden layer[cite: 1]. We explore the hyperparameter space — number of hidden units (`size`) and $L_2$ regularization on synaptic weights (`decay`, *weight decay*) — comparing two search strategies: **Grid Search** (optimized for Specificity) and **Random Search** (optimized for Accuracy)[cite: 1].
+
+**Behavior in the case study:** Neural networks are universal approximators capable of modeling highly non-linear relationships[cite: 1]. However, they require input normalization to the $[0, 1]$ range (`preProcess = "range"`) to prevent saturation of logistic activation functions, as well as an appropriate `decay` parameter to prevent the network from memorizing data points duplicated by oversampling[cite: 1].
+
+```{r model-nnet}
+set.seed(1234)
+target_col_idx <- which(names(global_Xprocessed.total) == "Bankrupt")
+
+# Strict cleaning of val_nn against NA/NaN/Inf
+val_nn <- clean_newdata(data.frame(predict(all_together, newdata = val_data[, selected_vars])))
+
+# 6.1 Grid Search Architecture (focus on Specificity)
+ctrl_nnd <- trainControl(method = "cv", number = 5, search = "grid", classProbs = TRUE, summaryFunction = twoClassSummary)
+tunegrid <- expand.grid(size = c(1:5), decay = c(0.001, 0.01, 0.05, 0.1, 0.3))
+
+if (file.exists("nnet_grid_model.rds")) {
+  nnetFit_def <- readRDS("nnet_grid_model.rds")
+} else {
+  set.seed(1234)
+  nnetFit_def <- train(x = global_Xprocessed.total[, -target_col_idx], 
+                       y = global_Xprocessed.total$Bankrupt,
+                       method = "nnet", preProcess = "range", 
+                       metric = "Spec", trControl = ctrl_nnd, tuneGrid = tunegrid,
+                       trace = FALSE, maxit = 300)
+  saveRDS(nnetFit_def, "nnet_grid_model.rds")
+}
+
+plot(nnetFit_def, main = "Neural Network Tuning (Grid Search)")
+confusionMatrix(nnetFit_def)
+
+# 6.2 Random Search Architecture (focus on Accuracy)
+ctrl_nnr <- trainControl(method = "cv", number = 5, search = "random", classProbs = TRUE)
+
+if (file.exists("nnet_rand_model.rds")) {
+  nnetFit_random <- readRDS("nnet_rand_model.rds")
+} else {
+  set.seed(1234)
+  nnetFit_random <- train(x = global_Xprocessed.total[, -target_col_idx], 
+                          y = global_Xprocessed.total$Bankrupt,
+                          method = "nnet", preProcess = "range", 
+                          metric = "Accuracy", trControl = ctrl_nnr,
+                          trace = FALSE, maxit = 300)
+  saveRDS(nnetFit_random, "nnet_rand_model.rds")
+}
+
+plot(nnetFit_random, main = "Neural Network Tuning (Random Search)")
+confusionMatrix(nnetFit_random)
+
+# Overfitting Check NN1 (Grid) and NN2 (Random)
+train_prob.nnd <- predict(nnetFit_def, global_Xprocessed.total[, -target_col_idx], type = "prob")
+test_prob.nnd  <- predict(nnetFit_def, val_nn, type = "prob")
+train_ASE.nnd  <- mean((y_ASE - ifelse(train_prob.nnd[, "c2"] > 0.5, 1, 0))^2)
+test_ASE.nnd   <- mean((y_ASE.test - ifelse(test_prob.nnd[, "c2"] > 0.5, 1, 0))^2)
+
+train_prob.nnr <- predict(nnetFit_random, global_Xprocessed.total[, -target_col_idx], type = "prob")
+test_prob.nnr  <- predict(nnetFit_random, val_nn, type = "prob")
+train_ASE.nnr  <- mean((y_ASE - ifelse(train_prob.nnr[, "c2"] > 0.5, 1, 0))^2)
+test_ASE.nnr   <- mean((y_ASE.test - ifelse(test_prob.nnr[, "c2"] > 0.5, 1, 0))^2)
+
+cat("NNet Grid   -> ASE (Train):", round(train_ASE.nnd, 4), "| ASE (Test):", round(test_ASE.nnd, 4), "\n")
+cat("NNet Random -> ASE (Train):", round(train_ASE.nnr, 4), "| ASE (Test):", round(test_ASE.nnr, 4), "\n")
+```
+
+---
+
+### Model 7: Gradient Boosting Machine (GBM)
+
+Unlike Random Forest (which builds deep, independent trees in parallel to reduce variance), **Gradient Boosting** builds shallow decision trees (*weak learners*) **sequentially**[cite: 1]. Each new tree is trained on the pseudo-residuals (the negative gradient of the loss function) of the preceding ensemble[cite: 1].
+
+**Behavior in the case study:** Boosting systematically reduces *bias* by focusing on the hardest-to-classify observations ("borderline" companies between solvency and insolvency)[cite: 1]. It proves to be one of the best-performing and most stable models across the entire Validation Set, maintaining a narrow gap between training and test error thanks to the shallow depth of individual trees[cite: 1].
+
+```{r model-gbm}
+set.seed(1234)
+metric <- "ROC"
+
+if (file.exists("gb_model.rds")) {
+  gb <- readRDS("gb_model.rds")
+} else {
+  set.seed(1234)
+  gb <- train(Bankrupt ~ ., data = oversampled, method = "gbm", trControl = cvCtrl, metric = metric, verbose = FALSE)
+  saveRDS(gb, "gb_model.rds")
+}
+
+gb
+getTrainPerf(gb)
+confusionMatrix(gb)
+
+# Overfitting Check (ASE)
+train_prob.gb <- predict(gb, oversampled, type = "prob")
+test_prob.gb  <- predict(gb, val_data, type = "prob")
+
+train_pred.gb <- ifelse(train_prob.gb[, "c2"] > 0.5, 1, 0)
+test_pred.gb  <- ifelse(test_prob.gb[, "c2"] > 0.5, 1, 0)
+
+train_ASE.gb <- mean((y_ASE - train_pred.gb)^2)
+test_ASE.gb  <- mean((y_ASE.test - test_pred.gb)^2)
+over.gb      <- ((train_ASE.gb - test_ASE.gb) / train_ASE.gb) * 100
+
+cat("ASE (Training):", round(train_ASE.gb, 4), 
+    "| ASE (Test):", round(test_ASE.gb, 4), 
+    "| % Change:", round(over.gb, 2), "%\n")
+```
+
+---
+
+## STEP 2: Model Comparison on the Validation Set (ROC and Gain/Lift)
+
+We compare the performance of all trained models on the **Validation Set** (which reflects the true market distribution, with only ~3.2% bankruptcies) using two evaluation tools[cite: 1]:
+1. **ROC Curves and AUC:** Measure the global ranking capability of the model across all possible cutoff thresholds[cite: 1].
+2. **Gain & Lift Analysis:** Measures how many times more effective the model is compared to random selection in capturing bankruptcies within the top risk deciles (e.g., focusing audits on the top 10%–30% highest-scoring firms)[cite: 1].
+
+```{r step2-roc-lift}
+# Probability score calculation (class c2 = Bankrupt) on the Validation Set
+val_scores <- data.frame(Bankrupt. = val_data$Bankrupt.)
+val_scores$knn            <- predict(knn, val_knn, type = "prob")[, "c2"]
+val_scores$glm            <- predict(glm, val_glm, type = "prob")[, "c2"]
+val_scores$lasso_PP       <- predict(lasso_PP, val_lasso, type = "prob")[, "c2"]
+val_scores$naivebayes     <- predict(naivebayes, val_nb, type = "prob")[, "c2"]
+val_scores$rf             <- predict(rf, val_data, type = "prob")[, "c2"]
+val_scores$nnetFit_def    <- predict(nnetFit_def, val_nn, type = "prob")[, "c2"]
+val_scores$nnetFit_random <- predict(nnetFit_random, val_nn, type = "prob")[, "c2"]
+val_scores$gb             <- predict(gb, val_data, type = "prob")[, "c2"]
+
+# ROC objects calculation
+roc.glm        <- roc(val_scores$Bankrupt., val_scores$glm, quiet = TRUE)
+roc.knn        <- roc(val_scores$Bankrupt., val_scores$knn, quiet = TRUE)
+roc.lasso_PP   <- roc(val_scores$Bankrupt., val_scores$lasso_PP, quiet = TRUE)
+roc.naivebayes <- roc(val_scores$Bankrupt., val_scores$naivebayes, quiet = TRUE)
+roc.rf         <- roc(val_scores$Bankrupt., val_scores$rf, quiet = TRUE)
+roc.nnd        <- roc(val_scores$Bankrupt., val_scores$nnetFit_def, quiet = TRUE)
+roc.nnr        <- roc(val_scores$Bankrupt., val_scores$nnetFit_random, quiet = TRUE)
+roc.gb         <- roc(val_scores$Bankrupt., val_scores$gb, quiet = TRUE)
+
+# Summary Table of Validation AUC and ASE
+summary_table <- data.frame(
+  Model = c("Random Forest", "Gradient Boosting", "GLM (Logistic)", "Neural Net (Grid)", "Neural Net (Random)", "K-NN", "Lasso", "Naive Bayes"),
+  AUC_Validation = round(c(auc(roc.rf), auc(roc.gb), auc(roc.glm), auc(roc.nnd), auc(roc.nnr), auc(roc.knn), auc(roc.lasso_PP), auc(roc.naivebayes)), 4),
+  ASE_Train = round(c(train_ASE.rf, train_ASE.gb, train_ASE.glm, train_ASE.nnd, train_ASE.nnr, train_ASE.knn, train_ASE.lasso, train_ASE.bayes), 4),
+  ASE_Validation = round(c(test_ASE.rf, test_ASE.gb, test_ASE.glm, test_ASE.nnd, test_ASE.nnr, test_ASE.knn, test_ASE.lasso, test_ASE.bayes), 4)
+)
+knitr::kable(summary_table[order(-summary_table$AUC_Validation), ], row.names = FALSE, caption = "Model Ranking by Validation Set AUC")
+
+# Comparative ROC Curves Plot
+plot(roc.glm, main = "ROC Curves Comparison (Validation Set)", col = "#16213A", lwd = 2)
+plot(roc.knn, add = TRUE, col = "#D6336C", lwd = 2)
+plot(roc.lasso_PP, add = TRUE, col = "#1F4FD8", lwd = 2)
+plot(roc.naivebayes, add = TRUE, col = "#E8A317", lwd = 2)
+plot(roc.nnd, add = TRUE, col = "#3B8F2E", lwd = 2)
+plot(roc.nnr, add = TRUE, col = "#7B3FD1", lwd = 2)
+plot(roc.rf, add = TRUE, col = "#E4572E", lwd = 2.5)
+plot(roc.gb, add = TRUE, col = "#0E9F8E", lwd = 2.5)
+legend("bottomright", 
+       legend = c("GLM", "K-NN", "Lasso", "Naive Bayes", "NNet (Grid)", "NNet (Random)", "Random Forest", "Gradient Boosting"), 
+       col = c("#16213A", "#D6336C", "#1F4FD8", "#E8A317", "#3B8F2E", "#7B3FD1", "#E4572E", "#0E9F8E"), 
+       lty = 1, lwd = 2, cex = 0.8)
+```
+
+### Gain & Lift Analysis on Top Models
+Looking at the 3rd decile (the top 30% of companies classified as highest risk), both Random Forest and Gradient Boosting achieve a **Lift above 3.1** (capturing over 90% of total bankruptcies while inspecting only 30% of the portfolio)[cite: 1].
+
+```{r gain-lift-plots}
+gain_lift(data = val_scores, score = 'rf', target = 'Bankrupt.')
+gain_lift(data = val_scores, score = 'gb', target = 'Bankrupt.')
+```
+
+---
+
+## STEP 3 & 4: Decision Threshold Optimization and Final Evaluation
+
+Once **Random Forest** is selected and its predicted probabilities on the Validation Set are recalibrated using the true population priors (`pred2_true.rf`), using a standard cutoff threshold of $0.5$ would be suboptimal for a rare event[cite: 1].
+
+We therefore examine the behavior of **Sensitivity (Recall)**, **Specificity**, **Precision**, and **F1-Measure** across the continuous range of decision thresholds, selecting the cutoff that **maximizes the F1-Measure**[cite: 1]:
+
+$$F_1 = 2 \cdot \frac{\text{Precision} \cdot \text{Sensitivity}}{\text{Precision} + \text{Sensitivity}}$$
+
+```{r step3-4-final}
+# Creating ROCR object on Random Forest recalibrated probabilities
+target_binary <- ifelse(val_data$Bankrupt. == "1", 1, 0)
+predRoc       <- prediction(pred2_true.rf, target_binary)
+
+acc.f     <- performance(predRoc, measure = "f")
+spec.perf <- performance(predRoc, measure = "spec")
+sens.perf <- performance(predRoc, measure = "sens")
+prec.perf <- performance(predRoc, measure = "prec")
+
+# Extracting the optimal cutoff that maximizes the F1-Measure
+f_values      <- unlist(acc.f@y.values)
+cutoff_values <- unlist(acc.f@x.values)
+best_index    <- which.max(f_values)
+best_fmeasure <- f_values[best_index]
+best_cutoff   <- cutoff_values[best_index]
+
+cat("Best Cutoff (F1-Max):", round(best_cutoff, 4), 
+    "| Maximum F1-Measure achieved:", round(best_fmeasure, 4), "\n")
+
+# Metrics trade-off plot
+plot(acc.f, col = "#D6336C", ylim = c(0, 1), lwd = 2.5, main = "Cutoff Optimization on Recalibrated Probabilities (RF)")
+plot(spec.perf, add = TRUE, col = "#E8A317", lwd = 2)
+plot(sens.perf, add = TRUE, col = "#7B3FD1", lwd = 2)
+plot(prec.perf, add = TRUE, col = "#16213A", lwd = 2)
+abline(v = best_cutoff, col = "#1F4FD8", lty = 2, lwd = 2)
+legend("bottomleft", 
+       legend = c("Sensitivity (Recall)", "Specificity", "Precision", "F1-Measure", paste("Best Cutoff =", round(best_cutoff, 3))), 
+       col = c("#7B3FD1", "#E8A317", "#16213A", "#D6336C", "#1F4FD8"), 
+       lty = c(1, 1, 1, 1, 2), lwd = 2, cex = 0.85)
+
+# Step 4: Final Confusion Matrix on the Validation Set
+actual_factor <- factor(ifelse(target_binary == 1, "c1", "c0"), levels = c("c0", "c1"))
+pred_factor   <- factor(ifelse(pred2_true.rf > best_cutoff, "c1", "c0"), levels = c("c0", "c1"))
+
+confusionMatrix(pred_factor, actual_factor, positive = "c1")
+
+# Consistency check with the true population distribution
+count_c1 <- sum(actual_factor == "c1")
+cat("True proportion of bankruptcies in the Validation Set:", round(count_c1 / nrow(val_data), 4), "\n")
+```
